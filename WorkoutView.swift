@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UIKit
 
 struct WorkoutView: View {
     @Environment(\.modelContext) private var context
@@ -8,6 +9,11 @@ struct WorkoutView: View {
     @Query(sort: \WeightEntry.date) private var entries: [WeightEntry]
     @AppStorage("activePersonID") private var activePersonID = ""
     @AppStorage("selectedDayID") private var selectedDayID = "d1"
+    @AppStorage("dayPickedOn") private var dayPickedOn = ""
+    // rest timer (stored so it survives leaving the app)
+    @AppStorage("restEnd") private var restEnd: Double = 0
+    @AppStorage("restTotal") private var restTotal: Double = 90
+    @AppStorage("restLabel") private var restLabel = ""
     @FocusState private var focusedField: String?
     @State private var confirmDiscard = false
 
@@ -42,10 +48,12 @@ struct WorkoutView: View {
                             isDone: activeSession?.completedIDs.contains(ex.id) ?? false,
                             current: latestEntry(for: ex)?.weight,
                             previous: previousEntry(for: ex),
+                            suggestion: suggestion(for: ex),
                             tint: day.color,
                             focus: $focusedField,
                             onToggle: { toggle(ex) },
-                            onSetWeight: { setWeight($0, for: ex) }
+                            onSetWeight: { setWeight($0, for: ex) },
+                            onRest: { startRest(ex) }
                         )
                     }
                 }
@@ -60,6 +68,7 @@ struct WorkoutView: View {
                         Button {
                             focusedField = nil
                             s.endedAt = .now
+                            stopRest()
                         } label: {
                             Label("Finish workout", systemImage: "flag.checkered")
                                 .bold()
@@ -74,6 +83,9 @@ struct WorkoutView: View {
                 }
             }
             .navigationTitle(person.map { "\($0.name)'s workout" } ?? "Workout")
+            .safeAreaInset(edge: .bottom) {
+                if restEnd > 0 { restBar }
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
@@ -83,10 +95,14 @@ struct WorkoutView: View {
             .confirmationDialog("Discard this workout?", isPresented: $confirmDiscard, titleVisibility: .visible) {
                 Button("Discard", role: .destructive) {
                     if let s = activeSession { context.delete(s) }
+                    stopRest()
                 }
             } message: {
                 Text("The timer and checkmarks are removed. Weights you logged stay saved.")
             }
+            .task(id: restEnd) { await watchRest() }
+            .onAppear(perform: pickNextDay)
+            .onChange(of: activePersonID) { _, _ in pickNextDay() }
         }
     }
 
@@ -98,6 +114,7 @@ struct WorkoutView: View {
                 let selected = d.id == day.id
                 Button {
                     selectedDayID = d.id
+                    dayPickedOn = Self.todayKey
                 } label: {
                     VStack(spacing: 2) {
                         Text(d.short).font(.headline)
@@ -151,7 +168,96 @@ struct WorkoutView: View {
         }
     }
 
+    private var restBar: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let remaining = Int((restEnd - ctx.date.timeIntervalSince1970).rounded(.up))
+            HStack(spacing: 12) {
+                Image(systemName: remaining > 0 ? "timer" : "checkmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(remaining > 0 ? day.color : Color.green)
+                VStack(alignment: .leading, spacing: 4) {
+                    if remaining > 0 {
+                        Text(formatClock(remaining))
+                            .font(.title2.bold().monospacedDigit())
+                        ProgressView(value: Double(max(0, remaining)), total: max(1, restTotal))
+                            .tint(day.color)
+                    } else {
+                        Text("Rest's up. Next set!").font(.headline)
+                    }
+                    Text(restLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if remaining > 0 {
+                    Button("+30s") { addRest(30) }
+                        .buttonStyle(.bordered)
+                    Button("Skip") { stopRest() }
+                        .buttonStyle(.bordered)
+                } else {
+                    Button("OK") { stopRest() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.green)
+                }
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .padding(.horizontal)
+            .padding(.bottom, 6)
+        }
+    }
+
+    // MARK: Rest timer
+
+    private func startRest(_ ex: Exercise) {
+        let end = Date.now.addingTimeInterval(Double(ex.rest))
+        restTotal = Double(ex.rest)
+        restLabel = ex.name
+        restEnd = end.timeIntervalSince1970
+        Task {
+            if await Reminders.requestPermission() {
+                RestNotifier.schedule(at: end, exerciseName: ex.name)
+            }
+        }
+    }
+
+    private func addRest(_ seconds: Double) {
+        restEnd += seconds
+        restTotal += seconds
+        RestNotifier.schedule(at: Date(timeIntervalSince1970: restEnd), exerciseName: restLabel)
+    }
+
+    private func stopRest() {
+        restEnd = 0
+        RestNotifier.cancel()
+    }
+
+    /// Buzzes when the rest ends while the app is open, then tidies the bar away.
+    private func watchRest() async {
+        guard restEnd > 0 else { return }
+        let end = restEnd
+        let wait = end - Date.now.timeIntervalSince1970
+        if wait > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
+        try? await Task.sleep(nanoseconds: 15_000_000_000)
+        if !Task.isCancelled && restEnd == end { restEnd = 0 }
+    }
+
     // MARK: Actions
+
+    private static var todayKey: String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: .now)
+        return "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"
+    }
+
+    /// With no workout going and nothing logged today, preselect the next day in the rotation.
+    private func pickNextDay() {
+        guard let p = person, activeSession == nil, dayPickedOn != Self.todayKey else { return }
+        let finished = Planner.finishedSorted(sessions, personID: p.id)
+        if finished.contains(where: { Calendar.current.isDateInToday($0.startedAt) }) { return }
+        selectedDayID = Planner.nextDay(finished: finished).id
+    }
 
     private func startSession(for p: Person) -> Session {
         let s = Session(personID: p.id, dayID: day.id, totalCount: day.exercises.count)
@@ -180,6 +286,25 @@ struct WorkoutView: View {
         history(for: ex).last { !Calendar.current.isDateInToday($0.date) }
     }
 
+    /// Suggest going up when the exercise was finished at the current weight in the last two workouts.
+    private func suggestion(for ex: Exercise) -> Double? {
+        guard let p = person, let current = latestEntry(for: ex)?.weight, current > 0 else { return nil }
+        let cal = Calendar.current
+        let doneDays = Set(sessions
+            .filter { $0.personID == p.id && $0.isFinished && $0.completedIDs.contains(ex.id)
+                && !cal.isDateInToday($0.startedAt) }
+            .map { cal.startOfDay(for: $0.startedAt) })
+            .sorted(by: >)
+        guard doneDays.count >= 2 else { return nil }
+        let hist = history(for: ex)
+        func weight(onDay day: Date) -> Double? {
+            guard let endOfDay = cal.date(byAdding: .day, value: 1, to: day) else { return nil }
+            return hist.last { $0.date < endOfDay }?.weight
+        }
+        guard weight(onDay: doneDays[0]) == current, weight(onDay: doneDays[1]) == current else { return nil }
+        return current + ex.step
+    }
+
     private func setWeight(_ value: Double?, for ex: Exercise) {
         guard let p = person else { return }
         let todays = history(for: ex).filter { Calendar.current.isDateInToday($0.date) }
@@ -200,10 +325,12 @@ struct ExerciseRow: View {
     let isDone: Bool
     let current: Double?
     let previous: WeightEntry?
+    let suggestion: Double?
     let tint: Color
     var focus: FocusState<String?>.Binding
     let onToggle: () -> Void
     let onSetWeight: (Double?) -> Void
+    let onRest: () -> Void
 
     @State private var text = ""
 
@@ -222,6 +349,14 @@ struct ExerciseRow: View {
                     Text(exercise.name).font(.headline).strikethrough(isDone)
                     Text(exercise.scheme).font(.subheadline).foregroundStyle(.secondary)
                 }
+                Spacer(minLength: 4)
+                Button(action: onRest) {
+                    Label(formatClock(exercise.rest), systemImage: "timer")
+                        .font(.caption.monospacedDigit())
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel("Start \(formatClock(exercise.rest)) rest timer")
             }
 
             HStack(spacing: 8) {
@@ -245,6 +380,27 @@ struct ExerciseRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.leading, 44)
+
+            if let s = suggestion {
+                Button {
+                    text = formatWeight(s)
+                    onSetWeight(s)
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Ready to go up: try \(formatWeight(s)) lb", systemImage: "arrow.up.circle.fill")
+                            .font(.subheadline.bold())
+                        Text("You finished \(formatWeight(current)) lb two workouts in a row. Tap to use it.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.borderless)
+                .tint(.green)
+                .padding(.leading, 44)
+            }
         }
         .padding(.vertical, 4)
         .onAppear { text = formatWeight(current) }

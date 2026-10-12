@@ -53,6 +53,8 @@ struct SettingsView: View {
                 } footer: {
                     Text("A training day with no workout logged shows as missed on the calendar.")
                 }
+
+                ReminderSection()
             }
             .navigationTitle("People")
             .confirmationDialog(
@@ -187,6 +189,52 @@ struct WeekdayPicker: View {
                 }
                 .buttonStyle(.borderless)
             }
+        }
+    }
+}
+
+struct ReminderSection: View {
+    @AppStorage("remindersOn") private var remindersOn = false
+    @AppStorage("reminderMinutes") private var reminderMinutes = 17 * 60
+    @State private var showDenied = false
+
+    private var time: Binding<Date> {
+        Binding(
+            get: {
+                Calendar.current.date(bySettingHour: reminderMinutes / 60, minute: reminderMinutes % 60,
+                                      second: 0, of: .now) ?? .now
+            },
+            set: {
+                let c = Calendar.current.dateComponents([.hour, .minute], from: $0)
+                reminderMinutes = (c.hour ?? 17) * 60 + (c.minute ?? 0)
+            }
+        )
+    }
+
+    var body: some View {
+        Section {
+            Toggle("Workout reminders", isOn: $remindersOn)
+            if remindersOn {
+                DatePicker("Remind me at", selection: time, displayedComponents: .hourAndMinute)
+            }
+        } header: {
+            Text("Reminders")
+        } footer: {
+            Text("On your training days you'll get a reminder with a bit of motivation. It's skipped if you've already been that day.")
+        }
+        .onChange(of: remindersOn) { _, on in
+            guard on else { return }
+            Task {
+                if !(await Reminders.requestPermission()) {
+                    remindersOn = false
+                    showDenied = true
+                }
+            }
+        }
+        .alert("Notifications are off", isPresented: $showDenied) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("To get reminders, turn on notifications for Gym Log in the iPhone Settings app under Notifications.")
         }
     }
 }
