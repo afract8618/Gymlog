@@ -55,6 +55,8 @@ struct SettingsView: View {
                 }
 
                 ReminderSection()
+
+                BackupSection()
             }
             .navigationTitle("People")
             .confirmationDialog(

@@ -18,6 +18,8 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \Person.createdAt) private var people: [Person]
     @Query private var sessions: [Session]
+    @Query private var entries: [WeightEntry]
+    @Query private var bodies: [BodyWeight]
     @AppStorage("activePersonID") private var activePersonID = ""
     @AppStorage("trainingDays") private var trainingDaysRaw = "2,3,5,6"
     @AppStorage("remindersOn") private var remindersOn = false
@@ -54,6 +56,13 @@ struct ContentView: View {
         .onChange(of: reminderMinutes) { _, _ in sync() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { sync() }
+            if phase == .background { AutoBackup.run(context: context) }
+        }
+        // Auto-backup a couple of seconds after anything changes (rapid edits are combined).
+        .task(id: dataSignature) {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            AutoBackup.run(context: context)
         }
     }
 
@@ -61,6 +70,13 @@ struct ContentView: View {
     private var sessionSignature: String {
         sessions.map { "\($0.id)-\($0.endedAt?.timeIntervalSince1970 ?? 0)-\($0.completedIDs.count)" }
             .joined(separator: "|")
+    }
+
+    /// Changes whenever any logged data changes.
+    private var dataSignature: String {
+        let w = entries.reduce(0.0) { $0 + $1.weight + $1.date.timeIntervalSince1970 }
+        let b = bodies.reduce(0.0) { $0 + $1.weight + $1.date.timeIntervalSince1970 }
+        return "\(sessionSignature)#\(entries.count)-\(w)#\(bodies.count)-\(b)#\(people.map(\.name).joined())"
     }
 
     private func sync() {
